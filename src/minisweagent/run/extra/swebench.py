@@ -26,6 +26,7 @@ from minisweagent.models import get_model
 from minisweagent.run.extra.utils.batch_progress import RunBatchProgressManager
 from minisweagent.run.utils.save import save_traj
 from minisweagent.utils.log import add_file_handler, logger
+from minisweagent.utils.repository import RepositoryError, delete_repository, upload_repository
 
 _HELP_TEXT = """Run mini-SWE-agent on SWEBench instances.
 
@@ -135,12 +136,31 @@ def process_instance(
     task = instance["problem_statement"]
 
     progress_manager.on_instance_start(instance_id)
-    progress_manager.update_instance_status(instance_id, "Pulling/starting docker")
 
     agent = None
     extra_info = None
+    repository_id = None
 
     try:
+        # Upload repository to CRA
+        progress_manager.update_instance_status(instance_id, "Uploading repo to CRA")
+        repo_name = instance.get("repo", "")
+        base_commit = instance.get("base_commit", None)
+        https_url = f"https://github.com/{repo_name}.git" if repo_name else None
+
+        if https_url:
+            logger.info(f"[{instance_id}] Uploading repository {https_url} (commit: {base_commit}) to CRA")
+            try:
+                upload_result = upload_repository(https_url=https_url, commit_id=base_commit)
+                repository_id = upload_result.get("repository_id")
+                logger.info(f"[{instance_id}] Repository uploaded successfully, ID: {repository_id}")
+            except RepositoryError as e:
+                logger.warning(f"[{instance_id}] Failed to upload repository to CRA: {e}")
+                # Continue without CRA if upload fails
+        else:
+            logger.warning(f"[{instance_id}] No repository information found in instance")
+
+        progress_manager.update_instance_status(instance_id, "Pulling/starting docker")
         env = get_sb_environment(config, instance)
         agent = ProgressTrackingAgent(
             model,
@@ -155,6 +175,16 @@ def process_instance(
         exit_status, result = type(e).__name__, str(e)
         extra_info = {"traceback": traceback.format_exc()}
     finally:
+        # Delete repository from CRA
+        if repository_id is not None:
+            try:
+                progress_manager.update_instance_status(instance_id, "Deleting repo from CRA")
+                logger.info(f"[{instance_id}] Deleting repository {repository_id} from CRA")
+                delete_repository(repository_id=repository_id, force=True)
+                logger.info(f"[{instance_id}] Repository deleted successfully")
+            except RepositoryError as e:
+                logger.warning(f"[{instance_id}] Failed to delete repository from CRA: {e}")
+
         save_traj(
             agent,
             instance_dir / f"{instance_id}.traj.json",
