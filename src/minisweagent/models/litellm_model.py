@@ -68,7 +68,21 @@ class LitellmModel:
     def query(self, messages: list[dict[str, str]], **kwargs) -> dict:
         if self.config.set_cache_control:
             messages = set_cache_control(messages, mode=self.config.set_cache_control)
-        response = self._query([{"role": msg["role"], "content": msg["content"]} for msg in messages], **kwargs)
+
+        # Filter messages to only include role and content (and tool-related fields)
+        filtered_messages = []
+        for msg in messages:
+            filtered_msg = {"role": msg["role"], "content": msg.get("content", "")}
+            # Include tool call fields if present
+            if "tool_calls" in msg:
+                filtered_msg["tool_calls"] = msg["tool_calls"]
+            if "tool_call_id" in msg:
+                filtered_msg["tool_call_id"] = msg["tool_call_id"]
+            if "name" in msg:
+                filtered_msg["name"] = msg["name"]
+            filtered_messages.append(filtered_msg)
+
+        response = self._query(filtered_messages, **kwargs)
         try:
             cost = litellm.cost_calculator.completion_cost(response, model=self.config.model_name)
             if cost <= 0.0:
@@ -89,12 +103,31 @@ class LitellmModel:
         self.n_calls += 1
         self.cost += cost
         GLOBAL_MODEL_STATS.add(cost)
-        return {
-            "content": response.choices[0].message.content or "",  # type: ignore
+
+        # Check for tool calls in response
+        message = response.choices[0].message
+        result = {
+            "content": message.content or "",
             "extra": {
                 "response": response.model_dump(),
             },
         }
+
+        # Add tool_calls to result if present
+        if hasattr(message, "tool_calls") and message.tool_calls:
+            result["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": tc.type,
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in message.tool_calls
+            ]
+
+        return result
 
     def get_template_vars(self) -> dict[str, Any]:
         return asdict(self.config) | {"n_model_calls": self.n_calls, "model_cost": self.cost}

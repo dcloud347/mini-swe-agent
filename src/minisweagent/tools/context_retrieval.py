@@ -5,13 +5,17 @@ from typing import Any
 
 import requests
 
-CRA_BASE_URL = os.environ.get("CRA_BASE_URL")
-
-CRA_RETRIEVAL_URL = f"{CRA_BASE_URL}/context/retrieve"
-
 
 class ContextRetrievalError(Exception):
     """Raised when context retrieval fails."""
+
+
+def _get_cra_retrieval_url() -> str:
+    """Get CRA retrieval URL from environment variable."""
+    cra_base_url = os.environ.get("CRA_BASE_URL")
+    if not cra_base_url:
+        raise ContextRetrievalError("CRA_BASE_URL environment variable is not set")
+    return f"{cra_base_url}/context/retrieve"
 
 
 def context_retrieval_tool(
@@ -45,17 +49,26 @@ def context_retrieval_tool(
         ...     print(ctx['content'])
     """
 
+    # Get CRA URL (read from environment at call time, not import time)
+    cra_url = _get_cra_retrieval_url()
+
+    # Get repository_id from environment
+    repository_id = os.environ.get("CRA_REPOSITORY_ID")
+    if not repository_id:
+        raise ContextRetrievalError("CRA_REPOSITORY_ID environment variable is not set. Repository must be uploaded first.")
+
     # Prepare request payload
     payload = {
         "query": query,
-        "max_refined_query": max_refined_query,
+        "max_refined_query_loop": max_refined_query,
+        "repository_id": int(repository_id),
     }
 
     response = None
     try:
         # Send POST request to CRA
         response = requests.post(
-            CRA_RETRIEVAL_URL,
+            cra_url,
             json=payload,
             timeout=None,
             headers={
@@ -72,7 +85,7 @@ def context_retrieval_tool(
         return data
 
     except requests.exceptions.ConnectionError as e:
-        raise ContextRetrievalError(f"Failed to connect to CRA at {CRA_RETRIEVAL_URL}: {e}") from e
+        raise ContextRetrievalError(f"Failed to connect to CRA at {cra_url}: {e}") from e
 
     except requests.exceptions.HTTPError as e:
         error_msg = f"CRA returned error status {response.status_code if response else 'unknown'}"
@@ -112,13 +125,24 @@ CONTEXT_RETRIEVAL_TOOL_DEFINITION = {
                     "type": "integer",
                     "description": "Maximum number of query refinements to perform for better results. "
                                    "Higher values may provide more rich and accurate context but take longer. "
-                                   "Default is 3.",
-                    "default": 3,
+                                   "Default is 1.",
+                    "default": 1,
                     "minimum": 1,
-                    "maximum": 5,
+                    "maximum": 1,
                 },
             },
             "required": ["query"],
         },
+        "examples": [
+            {
+                "query": "Find ALL self-contained context needed to understand the authentication implementation and how user credentials are validated in the system."
+            },
+            {
+                "query": "Find ALL self-contained context needed to understand how database errors are caught and handled throughout the application."
+            },
+            {
+                "query": "Find ALL self-contained context needed to understand the API routing structure and how endpoints are registered."
+            }
+        ],
     },
 }

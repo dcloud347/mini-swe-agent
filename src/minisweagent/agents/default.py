@@ -61,6 +61,28 @@ class DefaultAgent:
         self.model = model
         self.env = env
         self.extra_template_vars = {}
+        self.tools: dict[str, dict] = {}  # tool_name -> {definition, function}
+        self.tool_definitions: list[dict] = []  # OpenAI format tool definitions
+
+    def register_tool(self, name: str, description: str, parameters_schema: dict, function: callable) -> None:
+        """Register a tool that the agent can use.
+
+        Args:
+            name: Tool name
+            description: Tool description for the LLM
+            parameters_schema: JSON schema for tool parameters (OpenAI format)
+            function: Python function to execute when tool is called
+        """
+        tool_def = {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": parameters_schema,
+            },
+        }
+        self.tools[name] = {"definition": tool_def, "function": function}
+        self.tool_definitions.append(tool_def)
 
     def render_template(self, template: str, **kwargs) -> str:
         template_vars = asdict(self.config) | self.env.get_template_vars() | self.model.get_template_vars()
@@ -94,23 +116,72 @@ class DefaultAgent:
         """Query the model and return the response."""
         if 0 < self.config.step_limit <= self.model.n_calls or 0 < self.config.cost_limit <= self.model.cost:
             raise LimitsExceeded()
-        response = self.model.query(self.messages)
+        # Pass tools to model if any are registered
+        kwargs = {}
+        if self.tool_definitions:
+            kwargs["tools"] = self.tool_definitions
+        response = self.model.query(self.messages, **kwargs)
         self.add_message("assistant", **response)
         return response
 
     def get_observation(self, response: dict) -> dict:
         """Execute the action and return the observation."""
-        output = self.execute_action(self.parse_action(response))
-        observation = self.render_template(self.config.action_observation_template, output=output)
-        self.add_message("user", observation)
-        return output
+        # Check if response contains tool calls
+        if "tool_calls" in response:
+            return self.execute_tool_calls(response)
+        else:
+            # Regular bash command execution
+            output = self.execute_action(self.parse_action(response))
+            observation = self.render_template(self.config.action_observation_template, output=output)
+            self.add_message("user", observation)
+            return output
 
     def parse_action(self, response: dict) -> dict:
         """Parse the action from the message. Returns the action."""
-        actions = re.findall(self.config.action_regex, response["content"], re.DOTALL)
+        actions = re.findall(self.config.action_regex, response.get("content", ""), re.DOTALL)
         if len(actions) == 1:
             return {"action": actions[0].strip(), **response}
         raise FormatError(self.render_template(self.config.format_error_template, actions=actions))
+
+    def execute_tool_calls(self, response: dict) -> dict:
+        """Execute tool calls from the model response."""
+        import json
+
+        tool_calls = response["tool_calls"]
+        results = []
+
+        for tool_call in tool_calls:
+            tool_name = tool_call["function"]["name"]
+            tool_args_str = tool_call["function"]["arguments"]
+
+            # Parse arguments (they come as JSON string)
+            try:
+                tool_args = json.loads(tool_args_str) if isinstance(tool_args_str, str) else tool_args_str
+            except json.JSONDecodeError as e:
+                result = f"Error parsing tool arguments: {e}"
+                self.add_message("tool", content=result, tool_call_id=tool_call["id"], name=tool_name)
+                results.append({"tool": tool_name, "result": result, "error": True})
+                continue
+
+            # Execute tool
+            if tool_name not in self.tools:
+                result = f"Unknown tool: {tool_name}"
+                self.add_message("tool", content=result, tool_call_id=tool_call["id"], name=tool_name)
+                results.append({"tool": tool_name, "result": result, "error": True})
+                continue
+
+            try:
+                tool_function = self.tools[tool_name]["function"]
+                tool_result = tool_function(**tool_args)
+                result = str(tool_result)
+                self.add_message("tool", content=result, tool_call_id=tool_call["id"], name=tool_name)
+                results.append({"tool": tool_name, "result": result, "error": False})
+            except Exception as e:
+                result = f"Tool execution error: {type(e).__name__}: {str(e)}"
+                self.add_message("tool", content=result, tool_call_id=tool_call["id"], name=tool_name)
+                results.append({"tool": tool_name, "result": result, "error": True})
+
+        return {"tool_calls": results}
 
     def execute_action(self, action: dict) -> dict:
         try:

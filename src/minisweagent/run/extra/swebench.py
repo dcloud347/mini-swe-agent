@@ -5,6 +5,7 @@
 
 import concurrent.futures
 import json
+import os
 import random
 import re
 import threading
@@ -25,6 +26,7 @@ from minisweagent.environments import get_environment
 from minisweagent.models import get_model
 from minisweagent.run.extra.utils.batch_progress import RunBatchProgressManager
 from minisweagent.run.utils.save import save_traj
+from minisweagent.tools.context_retrieval import CONTEXT_RETRIEVAL_TOOL_DEFINITION, context_retrieval_tool
 from minisweagent.utils.log import add_file_handler, logger
 from minisweagent.utils.repository import RepositoryError, delete_repository, upload_repository
 
@@ -154,6 +156,8 @@ def process_instance(
                 upload_result = upload_repository(https_url=https_url, commit_id=base_commit)
                 repository_id = upload_result.get("repository_id")
                 logger.info(f"[{instance_id}] Repository uploaded successfully, ID: {repository_id}")
+                # Set repository_id in environment so the tool can access it
+                os.environ["CRA_REPOSITORY_ID"] = str(repository_id)
             except RepositoryError as e:
                 logger.warning(f"[{instance_id}] Failed to upload repository to CRA: {e}")
                 # Continue without CRA if upload fails
@@ -169,6 +173,17 @@ def process_instance(
             instance_id=instance_id,
             **config.get("agent", {}),
         )
+
+        # Register CRA context retrieval tool
+        if repository_id is not None:
+            logger.info(f"[{instance_id}] Registering CRA context retrieval tool")
+            agent.register_tool(
+                name=CONTEXT_RETRIEVAL_TOOL_DEFINITION["function"]["name"],
+                description=CONTEXT_RETRIEVAL_TOOL_DEFINITION["function"]["description"],
+                parameters_schema=CONTEXT_RETRIEVAL_TOOL_DEFINITION["function"]["parameters"],
+                function=context_retrieval_tool,
+            )
+
         exit_status, result = agent.run(task)
     except Exception as e:
         logger.error(f"Error processing instance {instance_id}: {e}", exc_info=True)
@@ -260,6 +275,13 @@ def main(
         config.setdefault("model", {})["model_name"] = model
     if model_class is not None:
         config.setdefault("model", {})["model_class"] = model_class
+
+    # Load environment variables from config (for CRA, API keys, etc.)
+    config_env_vars = config.get("environment", {}).get("env", {})
+    for key, value in config_env_vars.items():
+        if key not in os.environ and value:  # Don't override existing env vars
+            os.environ[key] = str(value)
+            logger.info(f"Set {key} from config")
 
     progress_manager = RunBatchProgressManager(len(instances), output_path / f"exit_statuses_{time.time()}.yaml")
 
